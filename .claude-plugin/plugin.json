@@ -1,0 +1,6 @@
+{
+  "name": "hud-session",
+  "version": "1.0.0",
+  "description": "HudSession: a side pane for Claude Code with the session (model, cost, context, usage limits), plugins, skills, MCP servers, path/branch and agents",
+  "types": "./types/index.d.ts"
+}
