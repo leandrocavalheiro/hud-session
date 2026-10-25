@@ -5,29 +5,61 @@ type Ctx = Parameters<HookFor<'session.start'>>[0]
 
 import type { AgentUsage, Flow, Usage } from '../types'
 
+// width of the main row's lead Client (hooks/lead.tsx): robot 5 + ` [Lead] ` 8 + `turn 99 · ` 10 + clock 16
+const LEAD_W = 39
+
 const usage = atom({ plugin: 'hud-session', key: 'usage' } as const, null)
 const agents = atom({ plugin: 'hud-session', key: 'agents' } as const, {} as Record<string, AgentUsage>)
 // effort of the main loop's last request; null until the first one
 const effort = atom({ plugin: 'hud-session', key: 'effort' } as const, null as string | null)
 // context tokens at the end of the main loop's last turns, oldest first
 const turns = atom({ plugin: 'hud-session', key: 'turns' } as const, [] as number[])
-// true once the user sends a new prompt: the shown agents belong to the previous request
-const stale = atom({ plugin: 'hud-session', key: 'stale' } as const, false)
 // the main session's task progress (set by the `progress` tool); null until the first call
 const flow = atom({ plugin: 'hud-session', key: 'flow' } as const, null as Flow | null)
+// the main loop's own activity: running from turn.start to turn.complete; null until the first turn
+const main = atom({ plugin: 'hud-session', key: 'main' } as const, null as { status: 'running' | 'done'; startedAt?: number; finishedAt?: number; turn?: number } | null)
+// the main loop's context tokens from the last API response of the running turn; null once session.measure lands
+const live = atom({ plugin: 'hud-session', key: 'live' } as const, null as number | null)
+// prompt-cache spend in the session so far (every agent) and when the main loop last got a response; null until the first priced one
+const cache = atom({ plugin: 'hud-session', key: 'cache' } as const, null as { usd: number; at: number } | null)
 const PANE = 'hud-session'
+// cost ledger kept in $.store (key COSTS): { [sessionId]: { usd, at } }, last 7 days, newest LEDGER entries
+const COSTS = 'costs'
+const LEDGER = 500
+const DAY = 86_400_000
+type Ledger = Record<string, { usd: number; at: number }>
+// Claude Code's prompt-cache TTL for this setup (1h writes); not exposed to mods
+const CACHE_TTL = 3_600_000
+// $ per MTok by model id prefix, most specific first; a cache write costs 2x input (1h TTL)
+const CACHE_PRICE: [string, { input: number; read: number }][] = [
+  ['claude-fable-5-1', { input: 10, read: 0.25 }], ['claude-mythos-5-1', { input: 10, read: 0.25 }],
+  ['claude-fable-5', { input: 10, read: 1 }], ['claude-mythos-5', { input: 10, read: 1 }],
+  ['claude-opus-5-5', { input: 4, read: 0.2 }],
+  ['claude-opus-5', { input: 5, read: 0.5 }], ['claude-opus-4', { input: 5, read: 0.5 }],
+  ['claude-sonnet-5-5', { input: 2, read: 0.2 }], ['claude-sonnet-5', { input: 2, read: 0.2 }],
+  ['claude-sonnet-4', { input: 3, read: 0.3 }],
+  ['claude-haiku-5-5', { input: 0.1, read: 0.01 }],
+  ['claude-haiku-4', { input: 1, read: 0.1 }],
+]
 const PHASES = ['plan', 'design', 'delegate', 'review', 'close']
 const HISTORY = 12
-// box borders and dividers share one discreet color
-const LINE = '#3b4252'
-// box titles and "Vazio": a gray that still reads on the dark background
-const MUTED = '#a3abb8'
-const BARS = '▁▂▃▄▅▆▇█'
+// MaterialM dark palette; every color the pane draws comes from here
+const THEME = { primary: '#5D87FF', secondary: '#49BEFF', success: '#13DEB9', warning: '#FFAE1F', error: '#FA896B', muted: '#7C8FAC', line: '#333F55', text: '#EAEFF4' }
+// text on a filled chip/badge
+const INK = '#1A2537'
+// Braille dots per column, bottom to top: 4 height levels
+const DOTS = [[0x40, 0x04, 0x02, 0x01], [0x80, 0x20, 0x10, 0x08]]
 
-// bars scale to the busiest turn shown, so growth shows at any fill level
-function sparkline(t: number[]): string {
-  const top = Math.max(...t, 1)
-  return t.map(n => BARS[Math.min(BARS.length - 1, Math.floor((n / top) * (BARS.length - 1)))]).join('')
+// one turn per cell, both Braille columns filled to the turn's height (1-4); bars scale to the busiest turn shown, a turn with tokens is never empty
+// returns the filled cells and the empty slots (full-height, drawn gray) up to HISTORY
+function sparkline(t: number[]): [string, string] {
+  const last = t.slice(-HISTORY)
+  const top = Math.max(...last, 1)
+  const filled = last.map(n => {
+    const h = n > 0 ? Math.max(1, Math.round((n / top) * 4)) : 0
+    return String.fromCharCode(0x2800 + DOTS.reduce((m, col) => col.slice(0, h).reduce((x, d) => x | d, m), 0))
+  }).join('')
+  return [filled, '\u28FF'.repeat(HISTORY - last.length)]
 }
 
 const LABEL: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
@@ -43,8 +75,21 @@ const ICON = {
 }
 const BAR = 10
 // subagent briefing: models skip reporting phrased as a condition, so it goes in the prompt itself
+// off: subagents report no steps, their bar falls back to token use; set true to ask them again
+const ASK_STEPS = false
 const STEP_BRIEF = '\n\nProgress reporting: before any other work, call `mcp__hud-session__step` with `total` (your plan in 3-8 steps) and `done: 0`; call it again with `done` and a few-word `note` as each step finishes. It only draws a progress bar.'
-const PALETTE = ['#e06c75', '#e5c07b', '#98c379', '#56b6c2', '#61afef', '#c678dd', '#d19a66']
+// agent role prefix from `subagentType name`, first match wins; numbered at spawn (Dev01, Dev02, QA01...)
+const ROLES: [RegExp, string][] = [[/\bplan/, 'Plan'], [/\b(review|audit)/, 'Rev'], [/\b(test|qa\b|verif)/, 'QA'], [/\b(explor|investigat|research|search)/, 'Exp']]
+const roleFor = (text: string, taken: AgentUsage[]) => {
+  const prefix = ROLES.find(([re]) => re.test(text.toLowerCase()))?.[1] ?? 'Dev'
+  return `${prefix}${String(1 + taken.filter(a => a.role?.startsWith(prefix) && /^\d\d$/.test(a.role.slice(prefix.length))).length).padStart(2, '0')}`
+}
+// context delta: whole units, no decimals, no sign (800, 3k, 1M); the color says up or down
+const deltaLabel = (d: number) => {
+  const a = Math.abs(d)
+  return `${a >= 1e6 ? `${Math.round(a / 1e6)}M` : a >= 1000 ? `${Math.round(a / 1000)}k` : Math.round(a)}`
+}
+const BADGES = [THEME.primary, THEME.secondary, THEME.success, THEME.warning, THEME.error, '#8965E5', '#E58FD0']
 const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
 const fit = (s: string, n: number) => (s.length > n ? `${s.slice(0, Math.max(1, n - 1))}…` : s)
 
@@ -56,23 +101,30 @@ function modelName(id: string): string {
   return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ''}`
 }
 
+// time left on the prompt cache: 59m · 1h05m · cold; - before any response
+function cacheLeft(at: number | undefined, now: number): string {
+  if (at == null) return '-'
+  const min = Math.round((at + CACHE_TTL - now) / 60000)
+  return min <= 0 ? 'cold' : min >= 60 ? `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}m` : `${min}m`
+}
+
 function resetIn(resetsAt: string | undefined, now: number): string {
   if (!resetsAt) return ''
   const min = Math.max(0, Math.round((Date.parse(resetsAt) - now) / 60000))
   const d = Math.floor(min / 1440)
   const h = Math.floor((min % 1440) / 60)
-  return ` (resets ${d ? `${d}d` : ''}${h}h${String(min % 60).padStart(2, '0')}m)`
+  return `reset ${d ? `${d}d` : ''}${h}h${String(min % 60).padStart(2, '0')}m`
 }
 
-// epoch ms -> 14:05, in the machine's local time
+// epoch ms -> 14:05:09, in the machine's local time
 function clock(ms: number): string {
   const d = new Date(ms)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
 }
 
-// verde < 25% · azul < 50% · amarelo < 75% · vermelho daí pra cima
+// green < 25% · blue < 50% · yellow < 75% · red above that
 function usedColor(pct: number): string {
-  return pct < 25 ? 'green' : pct < 50 ? 'blue' : pct < 75 ? 'yellow' : 'red'
+  return pct < 25 ? THEME.success : pct < 50 ? THEME.primary : pct < 75 ? THEME.warning : THEME.error
 }
 
 // 950 · 1.6k · 10.0k · 1.0M · 1.5M
@@ -81,13 +133,28 @@ function kTokens(n: number): string {
   return n >= 1e6 ? fmt(n / 1e6, 'M') : n >= 1000 ? fmt(n / 1000, 'k') : String(n)
 }
 
-// everything the boxes show, gathered once per draw; `cols` is the drawing site's own width (band or pane)
+// everything the pane shows, gathered once per draw; `cols` is the pane's body width
 async function gather($: Ctx, e: RenderInput, cols: number) {
-  const [u0, running, model, root, now, tools, commands, home, think, hist, fl] = await Promise.all([
+  const [u0, running, model, root, now, tools, commands, home, think, hist, fl, mn, lv, ch] = await Promise.all([
     read($, usage), read($, agents), $.session.model(), $.session.root(), $.clock.now(),
-    $.tool.list(), $.command.list(), $.env.get('HOME'), read($, effort), read($, turns), read($, flow),
+    $.tool.list(), $.command.list(), $.env.get('HOME'), read($, effort), read($, turns), read($, flow), read($, main), read($, live), read($, cache),
   ])
-  const u = u0 ?? (await $.session.usage())
+  const sid = await $.session.id().catch(() => '')
+  const ledger = ((await $.store.get(COSTS).catch(() => undefined)) ?? {}) as Ledger
+  const u1 = u0 ?? (await $.session.usage())
+  // cost footer: Today / 7d sums and the 7d mean per session; the live cost overrides the current ledger entry
+  const entries = Object.entries(u1.cost ? { ...ledger, [sid]: { usd: u1.cost.usd, at: now } } : ledger).map(([, v]) => v)
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0)
+  const wk = entries.filter(v => v.at >= now - 7 * DAY)
+  const today = entries.filter(v => v.at >= midnight.getTime())
+  const sum = (a: typeof wk) => a.reduce((t, v) => t + v.usd, 0)
+  const foot = [
+    { label: 'Today', usd: today.length ? sum(today) : undefined },
+    { label: '7d', usd: wk.length ? sum(wk) : undefined },
+    { label: 'avg', usd: wk.length ? sum(wk) / wk.length : undefined },
+  ]
+  // mid-turn the last response's size beats the stale measure; percent only when the window is known
+  const u: Usage = lv == null ? u1 : { ...u1, context: { ...u1.context, tokens: lv, ...(u1.context.window ? { percent: lv / u1.context.window * 100 } : {}) } }
   // before the first turn.step: the /config effort row, then the settings.json key, else 'default'
   const effortDefault = think ?? await $.config.list()
     .then(r => { const v = r.find(x => /effort/i.test(x.key))?.value; return typeof v === 'string' && v ? v : null }, () => null)
@@ -96,185 +163,265 @@ async function gather($: Ctx, e: RenderInput, cols: number) {
   const branch = await $.process.run(['git', 'branch', '--show-current'], { cwd: root })
     .then(r => (r.exitCode === 0 ? r.stdout.trim() : ''), () => '')
   const level = await $.fs.read(`${home}/.claude/.ponytail-active`).then(s => s.trim(), () => 'off')
-  // settings.json is read once: enabledPlugins for the plugin tags, the text for the hooks check
+  // settings.json is read once: enabledPlugins for the plugin chips, the text for the hooks check
   const settingsText = await $.fs.read(`${home}/.claude/settings.json`).catch(() => '')
   const plugins: Record<string, boolean> = (() => { try { return JSON.parse(settingsText).enabledPlugins ?? {} } catch { return {} } })()
-  // Orca já reescreveu o settings.json e apagou estes hooks: MCP on + hooks fora = amarelo
+  // Orca already rewrote settings.json and wiped these hooks: MCP on + hooks gone = yellow
   const aiMemoryHooks = /ai-memory.*hook --event/.test(settingsText)
   // mcp__<server>__<tool>; hud-session is this mod's own server
   const mcpServers = [...new Set(tools.map(t => t.name.startsWith('mcp__') ? t.name.split('__')[1] : undefined))]
     .filter((s): s is string => !!s && s !== 'hud-session')
   const graphify = commands.some(c => c.name.includes('graphify'))
 
-  const { Box, Text } = $.ui.resolve(e)
-  const sep = <Text dimColor> | </Text>
-  // each meter carries its width (`w`, in cells) so the session box wraps them like the tags
-  const bar = (label: string, raw: number, tail = '') => {
-    // over the limit reads 100%, nothing (or garbage) reads 0%
-    const pct = Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 0
-    return {
-      el: (
-        <Text>
-          <Text bold>{label} </Text>
-          <Text color={usedColor(pct)}>{'█'.repeat(Math.round((pct / 100) * BAR))}</Text>
-          <Text dimColor>{'░'.repeat(BAR - Math.round((pct / 100) * BAR))}</Text>
-          <Text color={usedColor(pct)}> {Math.round(pct)}%</Text>
-          <Text dimColor>{tail}</Text>
-        </Text>
-      ),
-      w: label.length + 1 + BAR + 2 + String(Math.round(pct)).length + tail.length,
-    }
+  const { Box, Text, Client } = $.ui.resolve(e)
+  const inner = Math.max(0, cols - 4) // site less 2 borders and 2 padding cells
+  // thin bar: filled in `color`, the rest in the line color
+  const thin = (frac: number, n: number, color: string) => {
+    const f = Math.round(Math.max(0, Math.min(1, frac)) * n)
+    return <Text><Text color={color}>{'━'.repeat(f)}</Text><Text color={THEME.line}>{'━'.repeat(n - f)}</Text></Text>
   }
+
+  // header: title, model + effort + branch, root path
+  const modelText = modelName(model)
+  const header = (
+    <Box borderStyle="round" borderColor={THEME.line} flexDirection="column" alignItems="center">
+      <Text color={THEME.primary} bold>HudSession</Text>
+      <Text wrap="truncate-end">
+        <Text color={THEME.primary}>{ICON.model} {modelText}</Text>
+        <Text color={THEME.muted}>  effort: {effortDefault}</Text>
+        {branch ? <Text color={THEME.success}>  {ICON.git} {branch}</Text> : null}
+      </Text>
+      <Text color={THEME.muted} wrap="truncate-end">{home && (root === home || root.startsWith(`${home}/`)) ? `~${root.slice(home.length)}` : root}</Text>
+    </Box>
+  )
+
+  // KPI cards: label, value, bar, sub-line (+ the context's last turns); `pct` set draws the bar
+  type Part = [string, { color?: string; bold?: boolean }?]
+  type Card = { key: string; label: string; value: string; color: string; pct?: number; sub?: string; extra?: Part[]; foot?: { label: string; usd?: number }[]; money?: number; right?: { label: string; reset: string; usd?: number } }
   const t = hist ?? []
   const delta = t.length > 1 ? t[t.length - 1]! - t[t.length - 2]! : 0
-  const deltaText = delta ? ` ${delta > 0 ? `▲ +${kTokens(delta)}` : `▼ ${kTokens(-delta)}`}` : ''
-  const lastTurns = {
-    el: (
-      <Text>
-        <Text bold>last turns </Text>
-        <Text color="yellow">{sparkline(t)}</Text>
-        {deltaText ? <Text dimColor>{deltaText}</Text> : null}
-      </Text>
-    ),
-    w: 11 + t.length + deltaText.length,
-  }
-  const cost = u.cost ? `$${u.cost.usd.toFixed(2)}` : ''
-  // no percent yet: still draw it at 0% so the layout never shifts
-  const ctxBar = bar('current context', u.context.percent ?? 0, u.context.percent != null && u.context.tokens != null ? ` ${kTokens(u.context.tokens)}/${kTokens(u.context.window)}` : ` 0.0k${u.context.window ? `/${kTokens(u.context.window)}` : ''}`)
-  // 5h and 7d always drawn (0% until the session reports them), then any other kind reported
-  const meters = [...Object.keys(LABEL), ...u.rateLimits.map(l => l.kind).filter(k => !(k in LABEL))].map(kind => {
-    const l = u.rateLimits.find(x => x.kind === kind)
-    return bar(LABEL[kind] ?? kind, l?.percentUsed ?? 0, resetIn(l?.resetsAt, now))
-  })
-  // the model line: model, then the session cost and the last turns
-  const modelText = modelName(model)
-  const modelLine = [
-    { el: <Text><Text color="cyan">{ICON.model} {modelText}</Text><Text dimColor> (thinking: {effortDefault})</Text></Text>, w: 2 + modelText.length + 12 + effortDefault.length },
-    ...(cost ? [{ el: <Text><Text bold>sessão </Text><Text dimColor>{cost}</Text></Text>, w: 7 + cost.length }] : []),
-    ...(t.length ? [lastTurns] : []),
+  // over the limit reads 100%, nothing (or garbage) reads 0%
+  const clamp = (raw: number) => (Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 0)
+  const ctxPct = clamp(u.context.percent ?? 0)
+  const cards: Card[] = [
+    { key: 'cost', label: 'Cost', value: '', money: u.cost?.usd, color: THEME.primary, foot, right: { label: 'Cache', reset: cacheLeft(ch?.at, now), usd: ch?.usd } },
+    {
+      key: 'context', label: 'Context', value: `${Math.round(ctxPct)}%`, color: usedColor(ctxPct), pct: ctxPct,
+      // no percent yet: still draw it at 0% so the layout never shifts
+      sub: `${u.context.percent != null && u.context.tokens != null ? `${kTokens(u.context.tokens)}/${kTokens(u.context.window)}` : `0.0k${u.context.window ? `/${kTokens(u.context.window)}` : ''}`}`,
+      // always drawn (12 gray slots before the first turn) so the card never changes shape
+      extra: [[sparkline(t)[0], { color: THEME.warning }], [sparkline(t)[1], { color: THEME.line }], ...(delta ? [[` ${deltaLabel(delta)}`, { color: delta > 0 ? THEME.error : THEME.success }]] : [])] as Part[],
+    },
+    // 5h and 7d always drawn (0% until the session reports them), then any other kind reported
+    ...[...Object.keys(LABEL), ...u.rateLimits.map(l => l.kind).filter(k => !(k in LABEL))].map(kind => {
+      const l = u.rateLimits.find(x => x.kind === kind)
+      const p = clamp(l?.percentUsed ?? 0)
+      return { key: kind, label: LABEL[kind] ?? kind, value: `${Math.round(p)}%`, color: usedColor(p), pct: p, sub: resetIn(l?.resetsAt, now) }
+    }),
   ]
-  // `w`: cells it takes (the Nerd Font glyph counts as one), for wrapping the hand-drawn boxes
-  const tag = (ok: boolean, icon: string, label: string, warn = false) => ({
-    el: <Text>{icon} <Text color={!ok ? 'red' : warn ? 'yellow' : 'green'}>{label}</Text></Text>,
-    w: label.length + 2,
+  const perRow = Math.min(cards.length, Math.max(1, Math.floor(cols / 18)))
+  const rows: Card[][] = []
+  for (let i = 0; i < cards.length; i += perRow) rows.push(cards.slice(i, i + perRow))
+  const cardBox = (c: Card, w: number, height: number) => {
+    const cw = Math.max(1, w - 4)
+    const row = (parts: Part[]) => {
+      const len = parts.reduce((s, [x]) => s + x.length, 0)
+      return (
+        <Text>
+          <Text color={THEME.line}>│ </Text>
+          {parts.map(([x, p]) => <Text {...p}>{x}</Text>)}
+          {' '.repeat(Math.max(0, cw - len))}
+          <Text color={THEME.line}> │</Text>
+        </Text>
+      )
+    }
+    // footer: 3 fixed columns + 2 separators fill cw exactly; the remainder goes to the first columns
+    const base = Math.floor((cw - 2) / 3), rem = (cw - 2) % 3
+    const ws = [0, 1, 2].map(i => base + (i < rem ? 1 : 0))
+    // offsets of the 2 column separators inside the w-2 span between the corners
+    const joints = c.foot ? [1 + ws[0]!, 2 + ws[0]! + ws[1]!] : []
+    const rule = (l: string, js: string[], r: string) =>
+      l + Array.from({ length: Math.max(0, w - 2) }, (_, i) => js[joints.indexOf(i)] ?? '─').join('') + r
+    // >= 1000: 0 decimals, >= 100: 1, else 2; fewer decimals if it does not fit the column
+    const usd = (v: number, n: number) => {
+      let d = v >= 1000 ? 0 : v >= 100 ? 1 : 2
+      while (d > 0 && `$${v.toFixed(d)}`.length > n) d--
+      return `$${v.toFixed(d)}`
+    }
+    // sparkline: narrower than the 12 slots keeps the newest filled cells, then as many empty slots as fit
+    // a delta part is kept whole: the cells give up room (oldest first) before it does
+    const spark = c.extra ? (() => { const dp = c.extra[2], room = cw - (dp?.[0].length ?? 0), f = c.extra[0]![0].slice(-Math.max(0, room)); return [[f, c.extra[0]![1]], [c.extra[1]![0].slice(0, Math.max(0, room - f.length)), c.extra[1]![1]], ...(dp ? [dp] : [])] as Part[] })() : null
+    const lines = [
+      row([[fit(c.label, cw), { color: THEME.muted }]]),
+      row([[fit(c.value, cw), { color: c.color, bold: true }]]),
+      c.pct != null ? <Text><Text color={THEME.line}>│ </Text>{thin(c.pct / 100, cw, c.color)}<Text color={THEME.line}> │</Text></Text> : row([]),
+      row([[fit(c.sub ?? '', cw), { color: THEME.muted }]]),
+      ...(spark ? [row(spark)] : []),
+    ]
+    if (c.foot) {
+      // centered like the labels
+      const mid = (x: string, n: number) => `${' '.repeat(Math.max(0, Math.floor((n - x.length) / 2)))}${x}`.padEnd(n)
+      const cols3 = (cell: (i: number) => Part): Part[] =>
+        ws.flatMap((_, i) => (i ? [['│', { color: THEME.line }] as Part, cell(i)] : [cell(i)]))
+      // top part split in two: left = footer column 1, right = columns 2 and 3 with their separator
+      const rw = ws[1]! + 1 + ws[2]!
+      const split = (l: Part, r: Part[]): Part[] => [[l[0].padEnd(ws[0]!), l[1]], ['│', { color: THEME.line }], ...r]
+      const rt = c.right
+      const rightVal: Part[] = rt?.usd == null
+        ? [['-', { color: THEME.muted }]]
+        : [[`${rt.reset} `, { color: THEME.muted }], [fit(usd(rt.usd, rw), Math.max(1, rw - rt.reset.length - 1)), { color: THEME.text }]]
+      lines.splice(0, 2,
+        row(split([fit(c.label, ws[0]!), { color: THEME.muted }], [[fit(rt?.label ?? '', rw), { color: THEME.muted }]])),
+        row(split(
+          c.money == null ? ['-', { color: THEME.muted }] : [fit(usd(c.money, ws[0]!), ws[0]!), { color: c.color, bold: true }],
+          rightVal,
+        )),
+      )
+      // the Cost card has no bar/sub line: divider + footer reuse those two slots and add one
+      lines.splice(2, 2,
+        <Text color={THEME.line}>{rule('├', ['┼', '┬'], '┤')}</Text>,
+        row(cols3(i => [mid(c.foot![i]!.label, ws[i]!), { color: THEME.muted }])),
+        row(cols3(i => { const v = c.foot![i]!.usd; return [v == null ? mid('-', ws[i]!) : fit(usd(v, ws[i]!), ws[i]!).padEnd(ws[i]!), { color: v == null ? THEME.muted : THEME.text }] })),
+      )
+    }
+    while (lines.length < height) lines.push(row([]))
+    return (
+      <Box key={`kpi-${c.key}`} flexDirection="column">
+        <Text color={THEME.line}>{rule('╭', ['┬'], '╮')}</Text>
+        {lines}
+        <Text color={THEME.line}>{rule('╰', ['┴', '┴'], '╯')}</Text>
+      </Box>
+    )
+  }
+  const kpis = (
+    <Box flexDirection="column">
+      {rows.map((r, i) => {
+        // cards stretch to fill the row: the remainder goes to the first ones
+        const height = r.some(c => c.extra || c.foot) ? 5 : 4
+        return <Box key={`kpi-row-${i}`}>{r.map((c, j) => cardBox(c, Math.floor(cols / r.length) + (j < cols % r.length ? 1 : 0), height))}</Box>
+      })}
+    </Box>
+  )
+
+  // frame drawn by hand: a Box border has no title, and an absolute title on it is not painted
+  // one line per row; no rows draws `empty` centered
+  const frame = (title: string, lines: ReturnType<typeof Text>[], empty = 'Empty') => (
+    <Box flexDirection="column">
+      <Text color={THEME.line}>╭─ <Text color={THEME.text} bold>{title}</Text> {'─'.repeat(Math.max(0, cols - 5 - title.length))}╮</Text>
+      {(lines.length ? lines : [<Text color={THEME.muted}>{empty}</Text>]).map(r => (
+        <Box>
+          <Text color={THEME.line}>│ </Text>
+          <Box flexGrow={1} justifyContent={lines.length ? 'flex-start' : 'center'}>{r}</Box>
+          <Text color={THEME.line}> │</Text>
+        </Box>
+      ))}
+      <Text color={THEME.line}>╰{'─'.repeat(Math.max(0, cols - 2))}╯</Text>
+    </Box>
+  )
+
+  // `w`: cells the chip takes (the Nerd Font glyph counts as one), for wrapping
+  const chip = (ok: boolean, icon: string, label: string, warn = false) => ({
+    el: <Text backgroundColor={!ok ? THEME.error : warn ? THEME.warning : THEME.success} color={INK}> {icon} {label} </Text>,
+    w: label.length + 4,
   })
+  type Chip = ReturnType<typeof chip>
+  // chips split into lines of the inner width, one cell between them
+  const wrapLines = (items: Chip[]) => items.reduce<Chip[][]>((ls, it) => {
+    const last = ls[ls.length - 1]
+    const used = last ? last.reduce((s, x) => s + x.w, 0) + (last.length - 1) : 0
+    if (last && used + 1 + it.w <= inner) last.push(it)
+    else ls.push([it])
+    return ls
+  }, [])
   // ponytail also needs its level on; other plugins are just enabled or not
-  const pluginTags = Object.entries(plugins).flatMap(([key, enabled]) => {
+  const pluginChips = Object.entries(plugins).flatMap(([key, enabled]) => {
     const name = key.split('@')[0]!
     if (name === 'hud-session') return [] // this mod itself
-    return [name === 'ponytail' ? tag(enabled && level !== 'off', ICON.ponytail, `ponytail(${level})`) : tag(enabled, ICON.plugin, name)]
+    return [name === 'ponytail' ? chip(enabled && level !== 'off', ICON.ponytail, `ponytail(${level})`) : chip(enabled, ICON.plugin, name)]
   })
-  const mcpTags = mcpServers.map(s => /^ai[-_]memory$/.test(s)
-    ? tag(true, ICON.memory, aiMemoryHooks ? 'ai-memory' : 'ai-memory (sem hooks)', !aiMemoryHooks)
-    : tag(true, ICON.mcp, s.replace(/^claude_ai_/, '').replace(/_/g, ' ')))
+  const mcpChips = mcpServers.map(s => /^ai[-_]memory$/.test(s)
+    ? chip(true, ICON.memory, aiMemoryHooks ? 'ai-memory' : 'ai-memory (no hooks)', !aiMemoryHooks)
+    : chip(true, ICON.mcp, s.replace(/^claude_ai_/, '').replace(/_/g, ' ')))
+  const sections: [string, Chip[]][] = [
+    ['Plugins', pluginChips], ['Skills', [chip(graphify, ICON.graphify, 'graphify')]], ['MCP', mcpChips],
+  ]
+  const integrations = frame('Integrations', sections.flatMap(([label, items]) => [
+    <Text color={THEME.muted}>{label}</Text>,
+    ...(items.length
+      ? wrapLines(items).map(l => <Box>{l.flatMap((c, i) => (i ? [<Text> </Text>, c.el] : [c.el]))}</Box>)
+      : [<Text color={THEME.muted}>Empty</Text>]),
+  ]))
 
   const all = Object.entries(running ?? {})
   const finished = all.filter(([, a]) => a.status === 'done').length
   // a finished flow stays drawn (full) until the next one starts
-  const fOn = fl
-  const taskPct = fOn ? (fOn.finished ? 1 : fOn.total ? Math.min(1, fOn.done / fOn.total) : 0) : all.length ? finished / all.length : 0
-  const miniBar = (frac: number, color: string) => {
-    const n = Math.round(Math.max(0, Math.min(1, frac)) * 12)
-    return <Text><Text color={color}>{'█'.repeat(n)}</Text><Text dimColor>{'░'.repeat(12 - n)}</Text></Text>
-  }
+  // no flow and no subagents: the task is the main loop's own turn
+  const mainTask = !fl && !all.length && !!mn
+  const taskPct = fl ? (fl.finished ? 1 : fl.total ? Math.min(1, fl.done / fl.total) : 0) : all.length ? finished / all.length : mainTask && mn.status === 'done' ? 1 : 0
   // the flow's own times; without a flow, the first agent's start and, once all are done, the last one's end
   const starts = all.map(([, a]) => a.startedAt).filter((v): v is number => v != null)
   const ends = all.map(([, a]) => a.finishedAt).filter((v): v is number => v != null)
-  const startedAt = fOn?.startedAt ?? (starts.length ? Math.min(...starts) : undefined)
-  const finishedAt = fOn ? fOn.finishedAt : all.length && finished === all.length && ends.length ? Math.max(...ends) : undefined
-  const taskRow = fOn || all.length ? (
-    <Text>
-      <Text color="cyan">{fOn?.title || 'current task'} </Text>{miniBar(taskPct, 'cyan')}<Text color="cyan"> {Math.round(taskPct * 100)}%</Text>
-      {fOn ? <Text dimColor>  {fOn.phase}</Text> : null}
-      {startedAt != null ? <Text dimColor>  started at {clock(startedAt)}</Text> : null}
-      {finishedAt != null ? <Text dimColor>  finished at {clock(finishedAt)}</Text> : null}
-    </Text>
+  const startedAt = fl?.startedAt ?? (starts.length ? Math.min(...starts) : mainTask ? mn.startedAt : undefined)
+  const finishedAt = fl ? fl.finishedAt : all.length && finished === all.length && ends.length ? Math.max(...ends) : mainTask && mn.status === 'done' ? mn.finishedAt : undefined
+  const taskRunning = fl ? !fl.finished : finishedAt == null
+  const taskRow = fl || all.length || mainTask ? (
+    <Box>
+      <Client key="sprite-task" module="./sprite.tsx" props={{ kind: 'task', running: taskRunning, color: THEME.primary, muted: THEME.muted, done: THEME.success }} width={5} height={1} />
+      <Text> </Text>
+      <Text wrap="truncate-end">
+        <Text color={THEME.primary} bold>{fl?.title || 'current task'} </Text>{thin(taskPct, 12, THEME.primary)}<Text color={THEME.primary}> {Math.round(taskPct * 100)}%</Text>
+        {fl ? <Text> <Text backgroundColor={THEME.primary} color={INK}> {fl.phase} </Text></Text> : null}
+        {startedAt != null ? <Text color={THEME.muted}>  started at {clock(startedAt)}</Text> : null}
+        {finishedAt != null ? <Text color={THEME.muted}>  finished at {clock(finishedAt)}</Text> : null}
+      </Text>
+    </Box>
   ) : null
+  // table columns: badge+name flexes, the rest is fixed
+  const MODEL = 11, EFFORT = 8, TOKENS = 7
+  // floor: the main row's lead Client (LEAD_W) must fit, so every row shares one grid
+  const nameW = Math.max(LEAD_W - 6, inner - (6 + MODEL + EFFORT + 13 + TOKENS))
+  const head = (
+    <Text color={THEME.muted} wrap="truncate-end">
+      {'AGENT'.padEnd(6 + nameW)}{'MODEL'.padEnd(MODEL)}{'EFFORT'.padEnd(EFFORT)}{'PROGRESS'.padEnd(13)}TOKENS
+    </Text>
+  )
   const sorted = [...all].sort(([, a], [, b]) => Number(a.status === 'done') - Number(b.status === 'done'))
+  // the main agent is always the first row, its bar the context fill
+  const mainEntry: [string, AgentUsage] = ['main', { model, tokens: u.context.tokens ?? 0, status: mn?.status ?? 'done', role: 'Lead', label: 'main', effort: effortDefault }]
+  const listed = [mainEntry, ...sorted]
   const agentRow = ([id, a]: [string, AgentUsage]) => {
     const done = a.status === 'done'
     const name = a.label ?? a.kind ?? id
-    const seed = a.kind ?? name
-    const badge = done ? '✓' : (name.charAt(0).toUpperCase() || '?')
-    const frac = done ? 1 : a.step?.total ? a.step.done / a.step.total : u.context.window ? a.tokens / u.context.window : 0
-    const indeterminate = !done && !a.step?.total && !u.context.window
+    const tag = a.role ? `[${a.role}] ` : ''
+    const badge = BADGES[hash(a.kind ?? name) % BADGES.length]!
+    const isMain = id === 'main' && a === mainEntry[1]
+    const frac = isMain ? ctxPct / 100 : done ? 1 : a.step?.total ? a.step.done / a.step.total : u.context.window ? a.tokens / u.context.window : 0
+    // main row: lead Client + pad must total the same cells as a subagent row (nameW + 6)
+    const indeterminate = !isMain && !done && !a.step?.total && !u.context.window
     return (
-      <Text key={id}>
-        <Text backgroundColor={done ? 'green' : PALETTE[hash(seed) % PALETTE.length]} color="black" bold> {badge} </Text>
-        <Text> {fit(name, Math.max(8, Math.floor((cols - 4) / 4)))}  </Text>
-        <Text dimColor>[{modelName(a.model)}] {a.effort ?? '-'}  </Text>
-        {indeterminate ? <Text dimColor>{'░'.repeat(12)}</Text> : miniBar(frac, done ? 'green' : usedColor(frac * 100))}
-        <Text dimColor> {kTokens(a.tokens)}</Text>
-      </Text>
+      <Box key={id} flexWrap="nowrap">
+        {isMain ? (
+          // one Client per row, at its start: a second Client in a row is drawn on the next line by the host
+          <Client key="lead-main" module="./lead.tsx" props={{ running: !done, color: badge, done: THEME.success, primary: THEME.primary, muted: THEME.muted, ...(mn?.turn ? { turn: mn.turn } : {}), ...(mn?.startedAt != null ? { since: mn.startedAt } : {}), ...(mn?.finishedAt != null ? { until: mn.finishedAt } : {}) }} width={LEAD_W} height={1} />
+        ) : (
+          <Client key={`sprite-${id}`} module="./sprite.tsx" props={{ running: !done, color: badge, done: THEME.success }} width={5} height={1} />
+        )}
+        <Text wrap="truncate-end">
+          {isMain ? null : tag ? <Text color={badge}> {tag.trimEnd()}</Text> : null}
+          <Text>{isMain ? ' '.repeat(Math.max(0, nameW + 6 - LEAD_W)) : ` ${fit(name, nameW - tag.length).padEnd(nameW - tag.length)}`}</Text>
+          <Text color={THEME.muted}>{fit(modelName(a.model), MODEL - 1).padEnd(MODEL)}{fit(a.effort ?? '-', EFFORT - 1).padEnd(EFFORT)}</Text>
+          {indeterminate ? <Text color={THEME.line}>{'━'.repeat(12)}</Text> : thin(frac, 12, done && !isMain ? THEME.success : usedColor(frac * 100))}
+          <Text color={THEME.muted}> {kTokens(a.tokens)}</Text>
+        </Text>
+      </Box>
     )
   }
-  // inner width: site less 2 borders and 2 padding cells; also stretches each box to the full site
-  const divider = <Text color={LINE}>{'─'.repeat(Math.max(0, cols - 4))}</Text>
-  // agents box without its agent lines: top and bottom lines + the task row, or the "Vazio" one
-  const agentsRows = taskRow || !all.length ? 3 : 2
-  // items split into lines of the inner width (site less "│ " and " │"); " | " between items is 3 cells
-  const wrapLines = (items: ReturnType<typeof tag>[]) => items.reduce<ReturnType<typeof tag>[][]>((ls, it) => {
-    const last = ls[ls.length - 1]
-    const used = last ? last.reduce((s, x) => s + x.w, 0) + 3 * (last.length - 1) : 0
-    if (last && used + 3 + it.w <= cols - 4) last.push(it)
-    else ls.push([it])
-    return ls
-  }, [])
-  // frame drawn by hand: a Box border has no title, and an absolute title on it is not painted
-  // one line per row; no rows draws `empty` centered
-  const frame = (title: string, rows: ReturnType<typeof Text>[], empty = 'Vazio') => (
-    <Box flexDirection="column">
-      <Text color={LINE}>╭─ <Text color={MUTED} bold>{title}</Text> {'─'.repeat(Math.max(0, cols - 5 - title.length))}╮</Text>
-      {(rows.length ? rows : [<Text color={MUTED}>{empty}</Text>]).map(r => (
-        <Box>
-          <Text color={LINE}>│ </Text>
-          <Box flexGrow={1} justifyContent={rows.length ? 'flex-start' : 'center'}>{r}</Box>
-          <Text color={LINE}> │</Text>
-        </Box>
-      ))}
-      <Text color={LINE}>╰{'─'.repeat(Math.max(0, cols - 2))}╯</Text>
-    </Box>
+  // the pane scrolls: every agent is drawn
+  const agentsBox = frame('Agents', [...(taskRow ? [taskRow] : []), head, ...listed.map(agentRow)])
+
+  return (
+    <Box flexDirection="column">{header}{kpis}{integrations}{agentsBox}</Box>
   )
-  const joined = (items: ReturnType<typeof tag>[]) =>
-    wrapLines(items).map(l => <Text wrap="truncate-end">{l.flatMap((p, i) => (i ? [sep, p.el] : [p.el]))}</Text>)
-  const listBox = (title: string, items: ReturnType<typeof tag>[]) => frame(title, joined(items))
-  // model line(s) | context alone | rate limits, a divider between each, inside the top and bottom lines
-  const sessionBox = frame('Session', [
-    ...joined(modelLine), divider, ...joined([ctxBar]), divider, ...joined(meters),
-  ])
-  const sessionRows = 5 + wrapLines(modelLine).length + wrapLines(meters).length
-  const pathBox = frame('Path', [
-    <Text wrap="truncate-end">
-      <Text color="white">{root}</Text>
-      {branch ? <Text><Text color="#f05032"> {ICON.git} </Text><Text color="#3fb950" bold>{branch}</Text></Text> : null}
-    </Text>,
-  ])
-  const pathRows = 3
-  const lists: [string, ReturnType<typeof tag>[]][] = [
-    ['Plugins', pluginTags], ['Skills', [tag(graphify, ICON.graphify, 'graphify')]], ['MCP', mcpTags],
-  ]
-  const tagsBox = <Box flexDirection="column">{lists.map(([t, it]) => listBox(t, it))}</Box>
-  // each box: its lines (at least the "Vazio" one) + top and bottom lines
-  const tagsRows = lists.reduce((s, [, it]) => s + 2 + Math.max(1, wrapLines(it).length), 0)
-  // `room` = rows left for agent lines
-  const agentsBox = (room: number) => {
-    // each agent line (and the "+N" one) takes 2 rows: its separator above it and itself
-    const cap = Math.floor(room / 2)
-    const shown = sorted.length > cap ? sorted.slice(0, Math.max(0, cap - 1)) : sorted
-    const hidden = sorted.length - shown.length
-    // rows truncate, so a long one never breaks the frame
-    const rows = [
-      ...(taskRow ? [taskRow] : []),
-      ...shown.map(agentRow),
-      ...(hidden ? [<Text dimColor>+{hidden}</Text>] : []),
-    ].map(r => <Text wrap="truncate-end">{r}</Text>)
-    return frame('Agents', rows.flatMap((r, i) => (i ? [divider, r] : [r])), 'no task')
-  }
-  // every box in its order; `rows` = rows taken before the agent lines
-  const boxes = (room: number) => (
-    <Box flexDirection="column">{sessionBox}{tagsBox}{pathBox}{agentsBox(room)}</Box>
-  )
-  return { boxes, rows: sessionRows + tagsRows + pathRows + agentsRows }
 }
 
 export const register: Register = on => {
@@ -329,14 +476,14 @@ export const register: Register = on => {
       // in every agent's tool list: workers do not go looking for it
       isDeferred: false,
     })
-    await $.command.register({ name: 'hud-session', description: 'Reabre o painel lateral do HudSession' })
+    await $.command.register({ name: 'hud-session', description: 'Reopen the HudSession side pane' })
     void $.ui.open({ id: PANE, title: 'HudSession' })
     return started
   })
 
   on('command.run', { command: 'hud-session' }, async $ => {
     await $.ui.open({ id: PANE, title: 'HudSession' })
-    return { text: 'Painel do HudSession aberto.' }
+    return { text: 'HudSession pane opened.' }
   })
 
   on('tool.call', { tool: /^mcp__hud-session__progress$/ }, async ($, e) => {
@@ -382,6 +529,8 @@ export const register: Register = on => {
       await update($, agents, a => (a?.[e.agentId!] ? { ...a, [e.agentId!]: { ...a[e.agentId!]!, status: 'done' as const, finishedAt: at } } : a ?? {}))
     }
     else {
+      const at = await $.clock.now().catch(() => undefined)
+      await update($, main, m => ({ ...m, status: 'done' as const, finishedAt: at })).catch(() => {})
       const tokens = await $.session.usage().then(s => s.context.tokens, () => undefined)
       if (tokens) await update($, turns, t => [...(t ?? []), tokens].slice(-HISTORY)).catch(() => {})
       $.ui.invalidate('ui.render') // ponytail level, MCPs and branch may have changed
@@ -392,27 +541,48 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     const u: Usage = { context: e.context, rateLimits: e.rateLimits, cost: e.cost }
     await update($, usage, () => u)
+    if (e.cost) {
+      const usd = e.cost.usd
+      // a store failure must never break the hook
+      await (async () => {
+        const id = await $.session.id()
+        const l = ((await $.store.get(COSTS)) ?? {}) as Ledger
+        if (l[id]?.usd === usd) return
+        const at = await $.clock.now()
+        const upd: Ledger = { ...l, [id]: { usd, at } }
+        const keep = Object.entries(upd).filter(([, v]) => v.at >= at - 7 * DAY).sort((a, b) => b[1].at - a[1].at).slice(0, LEDGER)
+        await $.store.set(COSTS, Object.fromEntries(keep))
+      })().catch(() => {})
+    }
+    await update($, live, () => null).catch(() => {})
     return next(e)
   })
 
-  // a new main-loop turn (the user's next prompt) only marks the batch stale: it stays on screen for review
+  // a new main-loop turn with a typed prompt starts a clean Agents box
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) await update($, stale, () => true).catch(() => {})
+    if (!e.agentId) {
+      // injected turns (<agent-message>, <task-notification>...) are continuations, not typed prompts
+      const typed = (e.text ?? '').trim()
+      if (typed && !typed.startsWith('<')) {
+        // a typed prompt: clean Agents box; a finished flow is over, so the task row falls back to this turn's times
+        await update($, agents, () => ({})).catch(() => {})
+        await update($, flow, f => (f?.finished ? null : f ?? null)).catch(() => {})
+        const at = await $.clock.now().catch(() => undefined)
+        await update($, main, m => ({ status: 'running' as const, startedAt: at, turn: (m?.turn ?? 0) + 1 })).catch(() => {})
+      }
+      // continuation (e.g. a background subagent finished): same request, keep agents, flow and start time
+      else await update($, main, m => ({ status: 'running' as const, ...(m?.startedAt != null ? { startedAt: m.startedAt } : {}), ...(m?.turn != null ? { turn: m.turn } : {}) })).catch(() => {})
+    }
     return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
-    const r = await next(e.prompt.includes('mcp__hud-session__step') ? e : { ...e, prompt: e.prompt + STEP_BRIEF })
+    const r = await next(!ASK_STEPS || e.prompt.includes('mcp__hud-session__step') ? e : { ...e, prompt: e.prompt + STEP_BRIEF })
     if ('agentId' in r && r.agentId) {
       const id = r.agentId
-      // the first agent of a new request replaces the stale batch; background agents still running stay
-      if (await read($, stale)) {
-        await update($, stale, () => false).catch(() => {})
-        await update($, agents, a => Object.fromEntries(Object.entries(a ?? {}).filter(([, v]) => v.status !== 'done'))).catch(() => {})
-      }
       // a failed write must never fail the spawn itself
       const at = await $.clock.now().catch(() => undefined)
-      await update($, agents, a => ({ ...a, [id]: { model: r.model, tokens: 0, status: 'running' as const, label: e.name ?? e.description ?? e.subagentType, kind: e.subagentType, startedAt: at } })).catch(() => {})
+      await update($, agents, a => ({ ...a, [id]: { model: r.model, tokens: 0, status: 'running' as const, role: roleFor(`${e.subagentType ?? ''} ${e.name ?? e.description ?? ''}`, Object.values(a ?? {})), label: e.name ?? e.description ?? e.subagentType, kind: e.subagentType, startedAt: at } })).catch(() => {})
     }
     return r
   })
@@ -426,44 +596,23 @@ export const register: Register = on => {
       const id = e.agentId
       // the agent's live context: everything the last response was answered over, plus what it wrote
       const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
-      await update($, agents, a => ({ ...a, [id]: { ...a?.[id], model: u.model, tokens, effort: eff, status: 'running' as const } }))
+      await update($, agents, a => (a?.[id] ? { ...a, [id]: { ...a[id]!, model: u.model, tokens, effort: eff, status: 'running' as const } } : a ?? {}))
+    }
+    if (u) {
+      // one response at a time, subagents included (cost is session-wide); only a main-loop response refreshes the TTL
+      const p = CACHE_PRICE.find(([k]) => u.model.startsWith(k))?.[1]
+      if (p) {
+        const add = (u.cache_read_input_tokens * p.read + u.cache_creation_input_tokens * p.input * 2) / 1e6
+        const at = await $.clock.now()
+        await update($, cache, c => ({ usd: (c?.usd ?? 0) + add, at: e.agentId && c ? c.at : at })).catch(() => {})
+      }
+    }
+    if (!e.agentId && u) {
+      const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
+      await update($, live, () => tokens).catch(() => {})
     }
     return r
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
-    // Stack other mods' bands below the HUD; Claude Code's own placeholder ({ type: 'engine' }) is never nested.
-    const drawn = await Promise.resolve(next(e)).catch(() => null)
-    const below = drawn && typeof drawn === 'object' && (drawn as { type?: string }).type !== 'engine' ? drawn : null
-
-    // every box lives in the pane; they come back to the band while the pane is not placed (narrow terminal, closed)
-    const inBand = !(await $.ui.panes().then(ps => ps.some(p => p.id === PANE && p.isPlaced), () => false))
-    if (!inBand) return drawn
-    const g = await gather($, e, e.props.bodyColumns)
-    const { Box } = $.ui.resolve(e)
-    // rows left for agent lines, under every box and any band below
-    const room = Math.max(0, e.props.maxRows - g.rows - (below ? 1 : 0))
-
-    return (
-      <Box flexDirection="column">
-        {g.boxes(room)}
-        {below}
-      </Box>
-    )
-  })
-
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const g = await gather($, e, e.props.bodyColumns)
-    const { Box, Text } = $.ui.resolve(e)
-    return (
-      <Box flexDirection="column">
-        <Box borderStyle="round" borderColor={LINE} justifyContent="center">
-          <Text color="cyan" bold>HudSession v1.0.0</Text>
-        </Box>
-        {/* the pane scrolls: every agent is drawn; only the band, which does not, trims them */}
-        {g.boxes(Infinity)}
-      </Box>
-    )
-  })
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => gather($, e, e.props.bodyColumns))
 }

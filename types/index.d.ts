@@ -6,7 +6,7 @@ export type Usage = {
 
 export type AgentUsage = {
   model: string; tokens: number; step?: { done: number; total: number; note?: string }
-  label?: string; kind?: string; effort?: string; status?: 'running' | 'done'
+  label?: string; kind?: string; role?: string; effort?: string; status?: 'running' | 'done'
   // epoch ms: when it was spawned, and when its last turn completed
   startedAt?: number; finishedAt?: number
 }
@@ -20,7 +20,9 @@ declare module 'claude-code' {
       effort: string | null
       flow: Flow | null
       turns: number[]
-      stale: boolean
+      live: number | null
+      cache: { usd: number; at: number } | null
+      main: { status: 'running' | 'done'; startedAt?: number; finishedAt?: number } | null
     }
   }
 }
